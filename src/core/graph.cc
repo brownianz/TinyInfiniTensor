@@ -1,4 +1,6 @@
 #include "core/graph.h"
+#include "operators/matmul.h"
+#include "operators/transpose.h"
 #include <algorithm>
 #include <numeric>
 #include <queue>
@@ -101,11 +103,109 @@ namespace infini
     void GraphObj::optimize()
     {
         // =================================== 作业 ===================================
-        // TODO: 设计一个算法来实现指定的图优化规则
-        // 图优化规则如下：
-        // 1. 去除冗余的算子（例如，两个相邻的算子都是 transpose 算子，且做的是相反的操作，可以将其全部删除）
-        // 2. 合并算子（例如，矩阵乘算子中含有属性transA、transB，如果其输入存在transpose，且对最后两个维度做交换，就可以将transpose融入到矩阵乘算子的属性中去）
+        // 目标（对齐 test_graph.cc）：
+        // 1) 消除相邻的 transpose({0,1,3,2}) + transpose({0,1,3,2})（互相抵消）
+        // 2) 将 matmul 输入侧的 transpose({0,1,3,2}) 融合进 matmul 的 transA/transB
         // =================================== 作业 ===================================
+
+        IT_ASSERT(topo_sort() == true);
+
+        const Shape kSwapLast2{0, 1, 3, 2};
+
+        std::unordered_set<OperatorObj *> removed_ops;
+        std::unordered_set<TensorObj *> removed_tensors;
+
+        // -------- 1) 消除 transpose + transpose（相邻、同 perm）--------
+        for (auto &op : ops)
+        {
+            if (op->getOpType().underlying() != 2) // transpose
+                continue;
+
+            auto trans2 = as<TransposeObj>(op);
+            auto in2 = trans2->getInputs()[0];
+            auto pred = in2->getSource();
+            if (!pred)
+                continue;
+            if (pred->getOpType().underlying() != 2)
+                continue;
+
+            auto trans1 = as<TransposeObj>(pred);
+
+            if (trans1->getPermute() != kSwapLast2 || trans2->getPermute() != kSwapLast2)
+                continue;
+
+            auto orig = trans1->getInputs()[0];
+            auto out2 = trans2->getOutputs()[0];
+
+            // 将 out2 的所有使用者改为使用 orig
+            auto targets = out2->getTargets(); // 拷贝，避免遍历时被修改
+            for (auto &user : targets)
+            {
+                user->replaceInput(out2, orig);
+            }
+
+            // 标记删除：两个 transpose op + 中间 tensor(in2) + out2
+            removed_ops.insert(trans1.get());
+            removed_ops.insert(trans2.get());
+            removed_tensors.insert(in2.get());
+            removed_tensors.insert(out2.get());
+        }
+
+        // -------- 2) 融合 transpose 到 matmul.transA/transB --------
+        for (auto &op : ops)
+        {
+            if (op->getOpType().underlying() != 7) // matmul
+                continue;
+
+            auto mm = as<MatmulObj>(op);
+
+            // A(0), B(1)
+            for (int idx = 0; idx < 2; ++idx)
+            {
+                auto in = mm->getInputs()[idx];
+                auto src = in->getSource();
+                if (!src)
+                    continue;
+
+                if (src->getOpType().underlying() != 2)
+                    continue;
+
+                auto trans = as<TransposeObj>(src);
+                if (trans->getPermute() != kSwapLast2)
+                    continue;
+
+                auto orig = trans->getInputs()[0];
+
+                // 用 orig 替换 matmul 的该输入
+                mm->replaceInput(in, orig);
+
+                // 融合进 transA/transB（这里用 toggle 更稳）
+                if (idx == 0)
+                    mm->setTransA(!mm->getTransA());
+                else
+                    mm->setTransB(!mm->getTransB());
+
+                // 删除该 transpose 以及它的输出 tensor（即 in）
+                removed_ops.insert(trans.get());
+                removed_tensors.insert(in.get());
+            }
+        }
+
+        // -------- 3) 从图中移除被标记的 op / tensor --------
+        ops.erase(std::remove_if(ops.begin(), ops.end(),
+                                 [&](const Operator &op)
+                                 { return removed_ops.count(op.get()); }),
+                  ops.end());
+
+        tensors.erase(std::remove_if(tensors.begin(), tensors.end(),
+                                     [&](const Tensor &t)
+                                     { return removed_tensors.count(t.get()); }),
+                      tensors.end());
+
+        // 重新标记拓扑序无效（因为图结构变了）
+        sorted = false;
+        IT_ASSERT(topo_sort() == true);
+        // =================================== 作业结束 ===================================
     }
 
     Tensor GraphObj::getTensor(int fuid) const
